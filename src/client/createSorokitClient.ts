@@ -340,7 +340,7 @@ export function createSorokitClient(
       },
       estimateFee: (input) => {
         logger.debug("transaction.estimateFee");
-        return estimateFee(rpcUrl, horizonUrl, networkConfig, input);
+        return estimateFee(rpcUrl, horizonUrl, networkConfig, input, config.cache);
       },
       stream: (publicKey, config, signal) => {
         logger.debug("transaction.stream", { publicKey });
