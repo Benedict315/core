@@ -1,6 +1,6 @@
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
-import { sleep, toMessage } from "../shared";
+import { sleep, toMessage, deepEqual } from "../shared";
 import type { SorokitLogger } from "../shared/logger";
 import type { AccountInfo } from "./types";
 import { getAccount } from "./getAccount";
@@ -56,6 +56,7 @@ export async function* streamAccount(
   const emitOnStart = config?.emitOnStart ?? true;
 
   let polls = 0;
+  let lastEmitted: AccountInfo | undefined;
 
   logger?.debug("account.stream", {
     operation: "account.stream",

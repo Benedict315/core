@@ -1,7 +1,7 @@
 import { Horizon } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
-import { sleep, toMessage, isNotFoundError } from "../shared";
+import { sleep, toMessage, isNotFoundError, deepEqual } from "../shared";
 import type { SorokitLogger } from "../shared/logger";
 import type { TransactionResult } from "./types";
 
@@ -81,6 +81,7 @@ export async function* streamTransactions(
 
   let cursor = config?.cursor;
   let polls = 0;
+  let lastEmitted: TransactionPage | undefined;
 
   logger?.debug("transaction.stream", {
     operation: "transaction.stream",
