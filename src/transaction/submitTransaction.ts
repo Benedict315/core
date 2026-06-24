@@ -1,10 +1,29 @@
 import { Horizon, TransactionBuilder } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
-import { toMessage, retryWithBackoff } from "../shared";
+import {
+  isNetworkConnectivityError,
+  isTimeoutError,
+  isXdrInvalidError,
+  retryWithBackoff,
+  toMessage,
+} from "../shared";
 import type { TransactionResult } from "./types";
 import type { SorokitCache } from "../shared/cache";
 import { DEFAULT_TX_CACHE_TTL_MS } from "../shared/constants";
+
+function describeSubmissionFailure(cause: unknown): string {
+  if (isXdrInvalidError(cause)) {
+    return `Transaction submission failed because the signed XDR is malformed: ${toMessage(cause)}`;
+  }
+  if (isTimeoutError(cause)) {
+    return `Transaction submission timed out while contacting Horizon: ${toMessage(cause)}`;
+  }
+  if (isNetworkConnectivityError(cause)) {
+    return `Transaction submission failed due to network connectivity: ${toMessage(cause)}`;
+  }
+  return `Transaction submission failed: ${toMessage(cause)}`;
+}
 
 /**
  * Submit a signed transaction XDR to the Stellar network via Horizon.
@@ -16,6 +35,14 @@ export async function submitTransaction(
   signedXdr: string,
   cache?: SorokitCache,
 ): Promise<SorokitResult<TransactionResult>> {
+  if (isXdrInvalidError(signedXdr)) {
+    return err(
+      SorokitErrorCode.TX_SUBMIT_FAILED,
+      "Transaction submission failed because the signed XDR is malformed.",
+      signedXdr,
+    );
+  }
+
   try {
     const response = await retryWithBackoff(async () => {
       const server = new Horizon.Server(horizonUrl);
@@ -39,7 +66,7 @@ export async function submitTransaction(
   } catch (cause) {
     return err(
       SorokitErrorCode.TX_SUBMIT_FAILED,
-      `Transaction submission failed: ${toMessage(cause)}`,
+      describeSubmissionFailure(cause),
       cause,
     );
   }
