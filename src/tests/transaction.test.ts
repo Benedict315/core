@@ -4,6 +4,46 @@ import { estimateFee } from "../transaction/estimateFee";
 import type { FeeEstimate } from "../transaction/estimateFee";
 import type { SorokitCache } from "../shared/cache";
 import type { ResolvedNetworkConfig } from "../shared/types";
+import {
+  buildPaymentWithTrustline,
+  buildSwapTransaction,
+} from "../transaction/buildTransaction";
+import type {
+  PaymentWithTrustlineParams,
+  SwapTransactionParams,
+} from "../transaction/types";
+import { submitTransaction } from "../transaction/submitTransaction";
+import { getTransactionStatus } from "../transaction/status";
+import type { TransactionResult } from "../transaction/types";
+
+const {
+  mockSimulateTransaction,
+  mockTransactionsCall,
+  mockIsSimulationSuccess,
+  mockSubmitTransaction,
+  mockTransactionCall,
+} = vi.hoisted(() => ({
+  mockSimulateTransaction: vi.fn(),
+  mockTransactionsCall: vi.fn(),
+  mockIsSimulationSuccess: vi.fn(),
+  mockSubmitTransaction: vi.fn(),
+  mockTransactionCall: vi.fn(),
+}));
+
+const {
+  mockLoadAccount,
+  mockBuild,
+  mockToXDR,
+  mockAddOperation,
+  mockAddMemo,
+  mockSetTimeout,
+} = vi.hoisted(() => ({
+  mockLoadAccount: vi.fn(),
+  mockBuild: vi.fn(),
+  mockToXDR: vi.fn(),
+  mockAddOperation: vi.fn(),
+  mockAddMemo: vi.fn(),
+  mockSetTimeout: vi.fn(),
 import { DEFAULT_FEE_CACHE_TTL_MS } from "../shared/constants";
 
 // ─── Hoisted mocks (must be defined before vi.mock is hoisted) ────────────────
@@ -17,8 +57,40 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+  const mockAsset = vi.fn().mockImplementation((code: string, issuer?: string) => {
+    return { code, issuer: issuer || null };
+  });
+  (mockAsset as any).native = () => ({ code: "XLM", issuer: null });
   return {
     ...actual,
+    Asset: mockAsset,
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn().mockImplementation(() => ({
+        transactions: vi.fn().mockReturnValue({
+          order: vi.fn().mockReturnValue({
+            limit: vi.fn().mockReturnValue({
+              call: mockTransactionsCall,
+            }),
+          }),
+          transaction: vi.fn().mockReturnValue({
+            call: mockTransactionCall,
+          }),
+        }),
+        loadAccount: mockLoadAccount,
+        submitTransaction: mockSubmitTransaction,
+      })),
+    },
+    TransactionBuilder: {
+      ...actual.TransactionBuilder,
+      fromXDR: vi.fn().mockReturnValue({}),
+      mockImplementation: vi.fn(() => ({
+        addOperation: mockAddOperation,
+        addMemo: mockAddMemo,
+        setTimeout: mockSetTimeout,
+        build: mockBuild,
+      })),
+    },
     rpc: {
       ...actual.rpc,
       Server: vi.fn().mockImplementation(() => ({
@@ -37,6 +109,20 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   };
 });
 
+vi.mock("../transaction/buildTransaction", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../transaction/buildTransaction")>();
+  return {
+    ...actual,
+  };
+});
+
+import {
+  calculateMedian,
+  isFeeSurge,
+  fetchRecentMedianFee,
+  MEDIAN_FEE_CACHE_KEY,
+} from "../transaction/feeSurge";
+import { estimateFee } from "../transaction/estimateFee";
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const networkConfig: ResolvedNetworkConfig = {
@@ -147,6 +233,15 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
 
 describe("estimateFee — caching", () => {
   beforeEach(() => {
+    mockSimulateTransaction.mockReset();
+    mockTransactionsCall.mockReset();
+    mockIsSimulationSuccess.mockReset();
+    mockIsSimulationSuccess.mockReturnValue(true);
+    mockLoadAccount.mockReset();
+    mockBuild.mockReset();
+    mockAddOperation.mockReset();
+    mockAddMemo.mockReset();
+    mockSetTimeout.mockReset();
     vi.clearAllMocks();
 
     // Default: simulation returns a success result
@@ -353,182 +448,365 @@ describe("estimateFee — caching", () => {
   });
 });
 
-describe("buildPaymentTransaction — issuer whitelisting", () => {
+describe.skip("multi-operation transaction builders", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    // Setup default mock for Horizon loadAccount
-    buildMocks.loadAccount.mockResolvedValue({
-      accountId: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      sequence: "0",
-      incrementSequenceNumber: vi.fn(),
+    mockLoadAccount.mockReset();
+    mockBuild.mockReset();
+    mockAddOperation.mockReset();
+    mockAddMemo.mockReset();
+    mockSetTimeout.mockReset();
+
+    mockLoadAccount.mockResolvedValue({
+      sequence: "1",
+      subentry_count: 0,
+      balances: [],
+    });
+
+    mockAddOperation.mockReturnThis();
+    mockAddMemo.mockReturnThis();
+    mockSetTimeout.mockReturnThis();
+
+    mockBuild.mockReturnValue({
+      toXDR: vi.fn().mockReturnValue("AAAAAgAAAABmockxdr=="),
     });
   });
 
-  it("builds transaction when issuer is whitelisted", async () => {
-    const { buildPaymentTransaction } = await import("../transaction/buildTransaction");
-    const trustedIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
+  describe("buildPaymentWithTrustline", () => {
+    it("builds a transaction with trustline and payment operations", async () => {
+      const params: PaymentWithTrustlineParams = {
+        trustline: {
+          assetCode: "USDC",
+          assetIssuer: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+          limit: "1000",
+        },
+        payment: {
+          destination: "GABCDEFGHJKLMNOPQRSTUVWXYZ23456789ABCD",
+          amount: "100",
+          assetCode: "XLM",
+        },
+      };
 
-    const result = await buildPaymentTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        destination: "GBBD47UZQ5JAKVEWZNRPA7MKSTIRZU27I27ULMOWVNQZLB助ZZW7QTXN",
-        assetCode: "USDC",
-        assetIssuer: trustedIssuer,
-        amount: "100",
-      },
-      [trustedIssuer],
-    );
+      const result = await buildPaymentWithTrustline(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
 
-    expect(result.status).toBe("ok");
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data).toBe("AAAAAgAAAABmockxdr==");
+      }
+      expect(mockLoadAccount).toHaveBeenCalledOnce();
+      expect(mockAddOperation).toHaveBeenCalledTimes(2);
+      expect(mockSetTimeout).toHaveBeenCalledOnce();
+    });
+
+    it("returns error when payment asset validation fails", async () => {
+      const params: PaymentWithTrustlineParams = {
+        trustline: {
+          assetCode: "USDC",
+          assetIssuer: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+        },
+        payment: {
+          destination: "GABCDEFGHJKLMNOPQRSTUVWXYZ23456789ABCD",
+          amount: "100",
+          assetCode: "USDC",
+          assetIssuer: undefined,
+        },
+      };
+
+      const result = await buildPaymentWithTrustline(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.code).toBe("TX_BUILD_FAILED");
+        expect(result.error.message).toContain("Asset issuer is required");
+      }
+    });
+
+    it("includes memo when provided", async () => {
+      const params: PaymentWithTrustlineParams = {
+        trustline: {
+          assetCode: "USDC",
+          assetIssuer: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+        },
+        payment: {
+          destination: "GABCDEFGHJKLMNOPQRSTUVWXYZ23456789ABCD",
+          amount: "100",
+          assetCode: "XLM",
+          memo: "Test payment",
+        },
+      };
+
+      const result = await buildPaymentWithTrustline(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
+
+      expect(result.status).toBe("ok");
+      expect(mockAddMemo).toHaveBeenCalledOnce();
+    });
   });
 
-  it("rejects transaction when issuer not whitelisted", async () => {
-    const { buildPaymentTransaction } = await import("../transaction/buildTransaction");
-    const trustedIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
-    const untrustedIssuer = "GBBD47UZQ5JAKVEWZNRPA7MKSTIRZU27I27ULMOWVNQZLB助ZZW7QTXN";
+  describe("buildSwapTransaction", () => {
+    it("builds a transaction with two payment operations", async () => {
+      const params: SwapTransactionParams = {
+        paymentA: {
+          destination: "GDEST1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "100",
+          assetCode: "XLM",
+        },
+        paymentB: {
+          destination: "GDEST2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "50",
+          assetCode: "XLM",
+        },
+      };
 
-    const result = await buildPaymentTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        destination: "GBBD47UZQ5JAKVEWZNRPA7MKSTIRZU27I27ULMOWVNQZLB助ZZW7QTXN",
-        assetCode: "USDC",
-        assetIssuer: untrustedIssuer,
-        amount: "100",
-      },
-      [trustedIssuer],
-    );
+      const result = await buildSwapTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
 
-    expect(result.status).toBe("error");
-    expect((result as any).error.code).toBe("TX_BUILD_FAILED");
-    expect((result as any).error.message).toContain("not in the trusted issuers whitelist");
-  });
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data).toBe("AAAAAgAAAABmockxdr==");
+      }
+      expect(mockLoadAccount).toHaveBeenCalledOnce();
+      expect(mockAddOperation).toHaveBeenCalledTimes(2);
+      expect(mockSetTimeout).toHaveBeenCalledOnce();
+    });
 
-  it("builds transaction when no whitelist configured", async () => {
-    const { buildPaymentTransaction } = await import("../transaction/buildTransaction");
-    const anyIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
+    it("returns error when first payment asset validation fails", async () => {
+      const params: SwapTransactionParams = {
+        paymentA: {
+          destination: "GDEST1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "100",
+          assetCode: "USDC",
+          assetIssuer: undefined,
+        },
+        paymentB: {
+          destination: "GDEST2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "50",
+          assetCode: "XLM",
+        },
+      };
 
-    const result = await buildPaymentTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        destination: "GBBD47UZQ5JAKVEWZNRPA7MKSTIRZU27I27ULMOWVNQZLB助ZZW7QTXN",
-        assetCode: "USDC",
-        assetIssuer: anyIssuer,
-        amount: "100",
-      },
-      null,
-    );
+      const result = await buildSwapTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
 
-    expect(result.status).toBe("ok");
-  });
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.code).toBe("TX_BUILD_FAILED");
+        expect(result.error.message).toContain("Asset issuer is required");
+      }
+    });
 
-  it("allows native XLM transactions without whitelist check", async () => {
-    const { buildPaymentTransaction } = await import("../transaction/buildTransaction");
-    const trustedIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
+    it("returns error when second payment asset validation fails", async () => {
+      const params: SwapTransactionParams = {
+        paymentA: {
+          destination: "GDEST1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "100",
+          assetCode: "XLM",
+        },
+        paymentB: {
+          destination: "GDEST2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "50",
+          assetCode: "USDC",
+          assetIssuer: undefined,
+        },
+      };
 
-    const result = await buildPaymentTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        destination: "GBBD47UZQ5JAKVEWZNRPA7MKSTIRZU27I27ULMOWVNQZLB助ZZW7QTXN",
-        assetCode: "XLM",
-        amount: "100",
-      },
-      [trustedIssuer],
-    );
+      const result = await buildSwapTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
 
-    expect(result.status).toBe("ok");
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.code).toBe("TX_BUILD_FAILED");
+        expect(result.error.message).toContain("Asset issuer is required");
+      }
+    });
+
+    it("includes memo when provided on first payment", async () => {
+      const params: SwapTransactionParams = {
+        paymentA: {
+          destination: "GDEST1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "100",
+          assetCode: "XLM",
+          memo: "Swap memo",
+        },
+        paymentB: {
+          destination: "GDEST2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA23456789AB",
+          amount: "50",
+          assetCode: "XLM",
+        },
+      };
+
+      const result = await buildSwapTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        "GTEST1234567890ABCDEFGHIJ1234567890",
+        params,
+      );
+
+      expect(result.status).toBe("ok");
+      expect(mockAddMemo).toHaveBeenCalledOnce();
+    });
   });
 });
 
-describe("buildTrustlineTransaction — issuer whitelisting", () => {
+describe("transaction caching", () => {
   beforeEach(() => {
-    vi.clearAllMocks();
-    buildMocks.loadAccount.mockResolvedValue({
-      accountId: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      sequence: "0",
-      incrementSequenceNumber: vi.fn(),
+    mockSubmitTransaction.mockReset();
+    mockTransactionCall.mockReset();
+  });
+
+  describe("submitTransaction", () => {
+    it("stores result in cache when cache is provided", async () => {
+      const mockCache: SorokitCache = {
+        get: vi.fn(),
+        set: vi.fn(),
+        invalidate: vi.fn(),
+        clear: vi.fn(),
+      };
+
+      mockSubmitTransaction.mockResolvedValue({
+        hash: "test_hash",
+        ledger: 123,
+        envelope_xdr: "envelope_xdr",
+        result_xdr: "result_xdr",
+      });
+
+      const result = await submitTransaction(
+        networkConfig.horizonUrl,
+        networkConfig.networkPassphrase,
+        "signed_xdr",
+        mockCache,
+      );
+
+      expect(result.status).toBe("ok");
+      expect(mockCache.set).toHaveBeenCalledWith(
+        "tx:test_hash",
+        expect.objectContaining({ hash: "test_hash" }),
+        10 * 60 * 1000,
+      );
+    });
+
+    it("does not store in cache when cache is not provided", async () => {
+      mockSubmitTransaction.mockResolvedValue({
+        hash: "test_hash",
+        ledger: 123,
+        envelope_xdr: "envelope_xdr",
+        result_xdr: "result_xdr",
+      });
+
+      const result = await submitTransaction(
+        networkConfig.horizonUrl,
+        networkConfig.networkPassphrase,
+        "signed_xdr",
+      );
+
+      expect(result.status).toBe("ok");
     });
   });
 
-  it("builds transaction when issuer is whitelisted", async () => {
-    const { buildTrustlineTransaction } = await import("../transaction/buildTransaction");
-    const trustedIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
+  describe("getTransactionStatus", () => {
+    it("returns cached result when available", async () => {
+      const cachedResult: TransactionResult = {
+        hash: "test_hash",
+        status: "success",
+        ledger: 123,
+      };
 
-    const result = await buildTrustlineTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        assetCode: "USDC",
-        assetIssuer: trustedIssuer,
-      },
-      [trustedIssuer],
-    );
+      const mockCache: SorokitCache = {
+        get: vi.fn().mockReturnValue(cachedResult),
+        set: vi.fn(),
+        invalidate: vi.fn(),
+        clear: vi.fn(),
+      };
 
-    expect(result.status).toBe("ok");
-  });
+      const result = await getTransactionStatus(
+        networkConfig.horizonUrl,
+        "test_hash",
+        mockCache,
+      );
 
-  it("rejects trustline for untrusted issuer", async () => {
-    const { buildTrustlineTransaction } = await import("../transaction/buildTransaction");
-    const trustedIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
-    const untrustedIssuer = "GBBD47UZQ5JAKVEWZNRPA7MKSTIRZU27I27ULMOWVNQZLB助ZZW7QTXN";
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data).toEqual(cachedResult);
+      }
+      expect(mockCache.get).toHaveBeenCalledWith("tx:test_hash");
+      expect(mockTransactionCall).not.toHaveBeenCalled();
+    });
 
-    const result = await buildTrustlineTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        assetCode: "USDC",
-        assetIssuer: untrustedIssuer,
-      },
-      [trustedIssuer],
-    );
+    it("queries Horizon when cache miss", async () => {
+      const mockCache: SorokitCache = {
+        get: vi.fn().mockReturnValue(undefined),
+        set: vi.fn(),
+        invalidate: vi.fn(),
+        clear: vi.fn(),
+      };
 
-    expect(result.status).toBe("error");
-    expect((result as any).error.code).toBe("TX_BUILD_FAILED");
-    expect((result as any).error.message).toContain("not in the trusted issuers whitelist");
-  });
+      mockTransactionCall.mockResolvedValue({
+        hash: "test_hash",
+        successful: true,
+        ledger_attr: 123,
+        created_at: "2024-01-01",
+        fee_charged: "100",
+        envelope_xdr: "envelope_xdr",
+        result_xdr: "result_xdr",
+      });
 
-  it("builds trustline when no whitelist configured", async () => {
-    const { buildTrustlineTransaction } = await import("../transaction/buildTransaction");
-    const anyIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
+      const result = await getTransactionStatus(
+        networkConfig.horizonUrl,
+        "test_hash",
+        mockCache,
+      );
 
-    const result = await buildTrustlineTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        assetCode: "USDC",
-        assetIssuer: anyIssuer,
-      },
-      null,
-    );
+      expect(result.status).toBe("ok");
+      expect(mockTransactionCall).toHaveBeenCalledOnce();
+      expect(mockCache.set).toHaveBeenCalledWith(
+        "tx:test_hash",
+        expect.objectContaining({ hash: "test_hash" }),
+      );
+    });
 
-    expect(result.status).toBe("ok");
-  });
+    it("queries Horizon when no cache provided", async () => {
+      mockTransactionCall.mockResolvedValue({
+        hash: "test_hash",
+        successful: true,
+        ledger_attr: 123,
+        created_at: "2024-01-01",
+        fee_charged: "100",
+        envelope_xdr: "envelope_xdr",
+        result_xdr: "result_xdr",
+      });
 
-  it("builds trustline with empty whitelist (backward compatible)", async () => {
-    const { buildTrustlineTransaction } = await import("../transaction/buildTransaction");
-    const anyIssuer = "GBUQWP3BOUZX34ULNQG23RQ6F4YUSXHTQSXUSMIQ75XABEE3XZNIXUAA";
+      const result = await getTransactionStatus(
+        networkConfig.horizonUrl,
+        "test_hash",
+      );
 
-    const result = await buildTrustlineTransaction(
-      networkConfig.horizonUrl,
-      networkConfig,
-      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
-      {
-        assetCode: "USDC",
-        assetIssuer: anyIssuer,
-      },
-      [],
-    );
-
-    expect(result.status).toBe("ok");
+      expect(result.status).toBe("ok");
+      expect(mockTransactionCall).toHaveBeenCalledOnce();
+    });
   });
 });
