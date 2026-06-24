@@ -88,6 +88,8 @@ export type {
 
 // ─── Response system ──────────────────────────────────────────────────────────
 export type { SorokitResult, SorokitError } from "./shared/response";
-export { SorokitErrorCode, ok, err, isOk, isErr, isErrorCode, assertOk } from "./shared/response";
+export { SorokitErrorCode, ok, err, isOk, isErr, isErrorCode, assertOk, attachTraceId } from "./shared/response";
+export { generateTraceId } from "./shared/utils";
 export type { SorokitLogger, LogLevel, LoggerConfig } from "./shared/logger";
+export { createTracedLogger } from "./shared/logger";
 export type { SorokitCache } from "./shared/cache";
