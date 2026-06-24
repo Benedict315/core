@@ -31,6 +31,16 @@ export interface FeeEstimate {
   baseFee: string;
   /** Whether the estimate came from a simulation (true) or is just the base fee (false) */
   simulated: boolean;
+  /** True when the estimated fee exceeds 2x the recent network median fee */
+  surge?: boolean;
+}
+
+/** Optional hooks and cache for fee estimation. */
+export interface FeeEstimateOptions {
+  /** Client-level cache for storing the recent median fee */
+  cache?: SorokitCache;
+  /** Invoked when a fee surge is detected — useful for logging or UI alerts */
+  onFeeSurge?: (estimate: FeeEstimate) => void;
 }
 
 /**
