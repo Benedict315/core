@@ -107,6 +107,8 @@ export interface SorokitClientConfig {
 export interface SorokitClient {
   /** Resolved network configuration for this client instance */
   readonly networkConfig: ResolvedNetworkConfig;
+  /** Trusted asset issuers whitelist — null means no whitelist (all issuers allowed) */
+  readonly trustedIssuers: string[] | null;
 
   readonly wallet: {
     /** Connect and return WalletState */
@@ -297,6 +299,7 @@ export function createSorokitClient(
 
   const client: SorokitClient = {
     networkConfig,
+    trustedIssuers: config.trustedIssuers ?? null,
 
     wallet: {
       connect: (adapter) =>
@@ -358,6 +361,7 @@ export function createSorokitClient(
           networkConfig,
           sourcePublicKey,
           params,
+          client.trustedIssuers,
         );
       },
       buildCreateAccount: (sourcePublicKey, params) => {
@@ -376,6 +380,7 @@ export function createSorokitClient(
           networkConfig,
           sourcePublicKey,
           params,
+          client.trustedIssuers,
         );
       },
       submit: (signedXdr) => {

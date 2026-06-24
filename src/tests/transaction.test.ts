@@ -194,6 +194,43 @@ function makeCacheWithHit(xdr: string, value: FeeEstimate): SorokitCache & {
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+// ─── Additional mocks for transaction building ────────────────────────────────
+
+const buildMocks = vi.hoisted(() => ({
+  loadAccount: vi.fn(),
+  build: vi.fn(),
+  toXDR: vi.fn(),
+}));
+
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+  return {
+    ...actual,
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn().mockImplementation(() => ({
+        simulateTransaction: mocks.simulateTransaction,
+        loadAccount: buildMocks.loadAccount,
+      })),
+    },
+    rpc: {
+      ...actual.rpc,
+      Server: vi.fn().mockImplementation(() => ({
+        simulateTransaction: mocks.simulateTransaction,
+      })),
+      Api: {
+        ...actual.rpc.Api,
+        isSimulationSuccess: mocks.isSimulationSuccess,
+        isSimulationError: mocks.isSimulationError,
+      },
+    },
+    TransactionBuilder: {
+      ...actual.TransactionBuilder,
+      fromXDR: mocks.fromXDR,
+    },
+  };
+});
+
 describe("estimateFee — caching", () => {
   beforeEach(() => {
     mockSimulateTransaction.mockReset();
