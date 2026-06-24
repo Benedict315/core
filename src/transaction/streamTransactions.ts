@@ -1,7 +1,8 @@
 import { Horizon } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
-import { sleep, toMessage, isNotFoundError, deepEqual } from "../shared";
+import { sleep, toMessage, isNotFoundError } from "../shared";
+import { deepEqual } from "../shared/utils";
 import type { SorokitLogger } from "../shared/logger";
 import type { TransactionResult } from "./types";
 
