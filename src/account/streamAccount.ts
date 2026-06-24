@@ -1,6 +1,7 @@
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
 import { sleep, toMessage, deepEqual } from "../shared";
+import type { SorokitLogger } from "../shared/logger";
 import type { AccountInfo } from "./types";
 import { getAccount } from "./getAccount";
 
@@ -48,6 +49,7 @@ export async function* streamAccount(
   publicKey: string,
   config?: AccountStreamConfig,
   signal?: AbortSignal,
+  logger?: SorokitLogger,
 ): AsyncGenerator<SorokitResult<AccountInfo>> {
   const intervalMs = Math.max(config?.intervalMs ?? 5_000, 1_000);
   const maxPolls = config?.maxPolls;
@@ -56,8 +58,24 @@ export async function* streamAccount(
   let polls = 0;
   let lastEmitted: AccountInfo | undefined;
 
+  logger?.debug("account.stream", {
+    operation: "account.stream",
+    status: "start",
+    publicKey,
+    intervalMs,
+    maxPolls,
+  });
+
   while (true) {
-    if (signal?.aborted) return;
+    if (signal?.aborted) {
+      logger?.debug("account.stream", {
+        operation: "account.stream",
+        status: "ok",
+        reason: "aborted",
+        polls,
+      });
+      return;
+    }
 
     // Respect maxPolls limit
     if (maxPolls !== undefined && polls >= maxPolls) return;
@@ -74,21 +92,44 @@ export async function* streamAccount(
     if (signal?.aborted) return;
 
     try {
+      logger?.debug("account.stream.poll", {
+        operation: "account.stream.poll",
+        status: "start",
+        publicKey,
+        poll: polls + 1,
+      });
+
       const result = await getAccount(horizonUrl, publicKey);
+
       if (result.status === "ok") {
-        if (!deepEqual(result.data, lastEmitted)) {
-          lastEmitted = result.data;
-          yield result;
-        }
+        logger?.debug("account.stream.poll", {
+          operation: "account.stream.poll",
+          status: "ok",
+          publicKey,
+          poll: polls + 1,
+        });
       } else {
-        yield result;
+        logger?.warn("account.stream.poll", {
+          operation: "account.stream.poll",
+          status: "error",
+          publicKey,
+          poll: polls + 1,
+          errorCode: result.error.code,
+          errorMessage: result.error.message,
+        });
       }
+
+      yield result;
     } catch (cause) {
-      yield err(
-        SorokitErrorCode.ACCOUNT_FETCH_FAILED,
-        `Account stream poll failed: ${toMessage(cause)}`,
-        cause,
-      );
+      const message = `Account stream poll failed: ${toMessage(cause)}`;
+      logger?.warn("account.stream.poll", {
+        operation: "account.stream.poll",
+        status: "error",
+        publicKey,
+        poll: polls + 1,
+        errorMessage: message,
+      });
+      yield err(SorokitErrorCode.ACCOUNT_FETCH_FAILED, message, cause);
     }
 
     polls++;
