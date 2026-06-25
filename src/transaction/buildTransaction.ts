@@ -5,6 +5,7 @@ import {
   Asset,
   Memo,
   BASE_FEE,
+  Account,
 } from "@stellar/stellar-sdk";
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
@@ -14,12 +15,42 @@ import { isNetworkConnectivityError, isTimeoutError, toMessage } from "../shared
 import { DEFAULT_TX_TIMEOUT_SECONDS } from "../shared/constants";
 import type { ResolvedNetworkConfig } from "../shared/types";
 import type {
+  MemoParams,
   PaymentParams,
   TrustlineParams,
   AccountCreateParams,
   PaymentWithTrustlineParams,
   SwapTransactionParams,
 } from "./types";
+
+// ─── Sequence cache (shared across builders for autoFetchSequence) ────────────
+
+const SEQUENCE_CACHE_TTL_MS = 5_000;
+const _sequenceCache = new Map<string, { sequence: string; cachedAt: number }>();
+
+function getSequenceCacheEntry(publicKey: string): Account | null {
+  const entry = _sequenceCache.get(publicKey);
+  if (!entry || Date.now() - entry.cachedAt > SEQUENCE_CACHE_TTL_MS) {
+    _sequenceCache.delete(publicKey);
+    return null;
+  }
+  return new Account(publicKey, entry.sequence);
+}
+
+function updateSequenceCache(publicKey: string, postBuildSequence: string): void {
+  const existing = _sequenceCache.get(publicKey);
+  _sequenceCache.set(publicKey, {
+    sequence: postBuildSequence,
+    cachedAt: existing?.cachedAt ?? Date.now(),
+  });
+}
+
+/** Clear the module-level sequence cache. Useful for test isolation. */
+export function clearSequenceCache(): void {
+  _sequenceCache.clear();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 function describeTransactionBuildFailure(action: string, cause: unknown): string {
   if (isTimeoutError(cause)) {
@@ -49,6 +80,44 @@ function resolveAsset(
     );
   }
   return ok(new Asset(assetCode, assetIssuer));
+}
+
+function validateMemoParams(params: MemoParams): SorokitResult<Memo | undefined> {
+  if (!params.memo) {
+    if (params.requireMemo) {
+      return err(
+        SorokitErrorCode.TX_BUILD_FAILED,
+        "Memo is required for this transaction",
+      );
+    }
+    return ok(undefined);
+  }
+
+  const memoType = params.memoType ?? "text";
+
+  try {
+    switch (memoType) {
+      case "text":
+        return ok(Memo.text(params.memo));
+      case "id":
+        return ok(Memo.id(params.memo));
+      case "hash":
+        return ok(Memo.hash(params.memo));
+      case "return":
+        return ok(Memo["return"](params.memo));
+      default:
+        return err(
+          SorokitErrorCode.TX_BUILD_FAILED,
+          `Unsupported memo type: ${memoType}. Supported memo types are text, id, hash, return.`,
+        );
+    }
+  } catch (cause) {
+    return err(
+      SorokitErrorCode.TX_BUILD_FAILED,
+      `Invalid memo for type ${memoType}: ${toMessage(cause)}`,
+      cause,
+    );
+  }
 }
 
 /**
@@ -86,8 +155,21 @@ export async function buildPaymentTransaction(
   }
 
   try {
-    const server = new Horizon.Server(horizonUrl);
-    const sourceAccount = await server.loadAccount(sourcePublicKey);
+    const useCache = params.autoFetchSequence === true;
+    let sourceAccount: Account | Awaited<ReturnType<Horizon.Server["loadAccount"]>>;
+
+    if (useCache) {
+      const cached = getSequenceCacheEntry(sourcePublicKey);
+      if (cached) {
+        sourceAccount = cached;
+      } else {
+        const server = new Horizon.Server(horizonUrl);
+        sourceAccount = await server.loadAccount(sourcePublicKey);
+      }
+    } else {
+      const server = new Horizon.Server(horizonUrl);
+      sourceAccount = await server.loadAccount(sourcePublicKey);
+    }
 
     const builder = new TransactionBuilder(sourceAccount, {
       fee: BASE_FEE,
@@ -102,11 +184,18 @@ export async function buildPaymentTransaction(
       )
       .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS);
 
-    if (params.memo) {
-      builder.addMemo(Memo.text(params.memo));
+    const memoResult = validateMemoParams(params);
+    if (memoResult.status === "error") return memoResult;
+    if (memoResult.status === "ok" && memoResult.data) {
+      builder.addMemo(memoResult.data);
     }
 
-    return ok(builder.build().toXDR());
+    const tx = builder.build();
+    if (useCache) {
+      updateSequenceCache(sourcePublicKey, sourceAccount.sequenceNumber());
+    }
+
+    return ok(tx.toXDR());
   } catch (cause) {
     return err(
       SorokitErrorCode.TX_BUILD_FAILED,
@@ -126,10 +215,23 @@ export async function buildCreateAccountTransaction(
   params: AccountCreateParams,
 ): Promise<SorokitResult<string>> {
   try {
-    const server = new Horizon.Server(horizonUrl);
-    const sourceAccount = await server.loadAccount(sourcePublicKey);
+    const useCache = params.autoFetchSequence === true;
+    let sourceAccount: Account | Awaited<ReturnType<Horizon.Server["loadAccount"]>>;
 
-    const tx = new TransactionBuilder(sourceAccount, {
+    if (useCache) {
+      const cached = getSequenceCacheEntry(sourcePublicKey);
+      if (cached) {
+        sourceAccount = cached;
+      } else {
+        const server = new Horizon.Server(horizonUrl);
+        sourceAccount = await server.loadAccount(sourcePublicKey);
+      }
+    } else {
+      const server = new Horizon.Server(horizonUrl);
+      sourceAccount = await server.loadAccount(sourcePublicKey);
+    }
+
+    const builder = new TransactionBuilder(sourceAccount, {
       fee: BASE_FEE,
       networkPassphrase: networkConfig.networkPassphrase,
     })
@@ -139,8 +241,18 @@ export async function buildCreateAccountTransaction(
           startingBalance: params.startingBalance,
         }),
       )
-      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS)
-      .build();
+      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS);
+
+    const memoResult = validateMemoParams(params);
+    if (memoResult.status === "error") return memoResult;
+    if (memoResult.status === "ok" && memoResult.data) {
+      builder.addMemo(memoResult.data);
+    }
+
+    const tx = builder.build();
+    if (useCache) {
+      updateSequenceCache(sourcePublicKey, sourceAccount.sequenceNumber());
+    }
 
     return ok(tx.toXDR());
   } catch (cause) {
@@ -180,12 +292,25 @@ export async function buildTrustlineTransaction(
   }
 
   try {
-    const server = new Horizon.Server(horizonUrl);
-    const sourceAccount = await server.loadAccount(sourcePublicKey);
+    const useCache = params.autoFetchSequence === true;
+    let sourceAccount: Account | Awaited<ReturnType<Horizon.Server["loadAccount"]>>;
+
+    if (useCache) {
+      const cached = getSequenceCacheEntry(sourcePublicKey);
+      if (cached) {
+        sourceAccount = cached;
+      } else {
+        const server = new Horizon.Server(horizonUrl);
+        sourceAccount = await server.loadAccount(sourcePublicKey);
+      }
+    } else {
+      const server = new Horizon.Server(horizonUrl);
+      sourceAccount = await server.loadAccount(sourcePublicKey);
+    }
 
     const asset = new Asset(params.assetCode, params.assetIssuer);
 
-    const tx = new TransactionBuilder(sourceAccount, {
+    const builder = new TransactionBuilder(sourceAccount, {
       fee: BASE_FEE,
       networkPassphrase: networkConfig.networkPassphrase,
     })
@@ -195,8 +320,18 @@ export async function buildTrustlineTransaction(
           ...(params.limit !== undefined && { limit: params.limit }),
         }),
       )
-      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS)
-      .build();
+      .setTimeout(DEFAULT_TX_TIMEOUT_SECONDS);
+
+    const memoResult = validateMemoParams(params);
+    if (memoResult.status === "error") return memoResult;
+    if (memoResult.status === "ok" && memoResult.data) {
+      builder.addMemo(memoResult.data);
+    }
+
+    const tx = builder.build();
+    if (useCache) {
+      updateSequenceCache(sourcePublicKey, sourceAccount.sequenceNumber());
+    }
 
     return ok(tx.toXDR());
   } catch (cause) {

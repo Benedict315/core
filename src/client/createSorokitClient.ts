@@ -32,15 +32,17 @@ import { simulateTransaction } from "../soroban/simulateTransaction";
 import { executeContract } from "../soroban/executeContract";
 import { invokeContract } from "../soroban/invokeContract";
 import { getContractMethods } from "../soroban/contractMetadata";
-import { createLogger, withLogging } from "../shared/logger";
-import { formatAddress } from "../shared/utils";
+import { createLogger, createTracedLogger, withLogging } from "../shared/logger";
+import { formatAddress, generateTraceId } from "../shared/utils";
 import { ok } from "../shared/response";
 import type { SorokitResult } from "../shared/response";
 import type { LogLevel, SorokitLogger } from "../shared/logger";
 import type { SorokitCache } from "../shared/cache";
 import type { ResolvedNetworkConfig } from "../shared/types";
 import type { ErrorHandler, ErrorContext } from "../shared/errors";
-import { applyErrorHandler, withErrorHandling } from "../shared/errors";
+import { applyErrorHandler, withErrorHandling, applyCodeTransformer } from "../shared/errors";
+import type { ErrorCodeTransformer } from "../shared/errors";
+import { TokenBucketRateLimiter } from "../shared/utils";
 import type { NetworkType } from "../network/config";
 import type {
   WalletAdapter,
@@ -102,6 +104,15 @@ export interface SorokitClientConfig {
   errorHandler?: ErrorHandler;
   /** Trusted asset issuers whitelist — null means no whitelist (all issuers allowed) */
   trustedIssuers?: string[];
+  /** Optional error code transformer — maps SDK error codes to consumer-specific strings before returning any error result */
+  errorCodeTransformer?: ErrorCodeTransformer;
+  /** Max transaction submissions per second — activates token bucket rate limiting on transaction.submit() */
+  maxTxPerSecond?: number;
+  /**
+   * Correlation ID for this client. Included in every log entry and stamped onto
+   * every error returned by client methods. Generated automatically when omitted.
+   */
+  traceId?: string;
 }
 
 // ─── Client interface ─────────────────────────────────────────────────────────
@@ -111,6 +122,8 @@ export interface SorokitClient {
   readonly networkConfig: ResolvedNetworkConfig;
   /** Trusted asset issuers whitelist — null means no whitelist (all issuers allowed) */
   readonly trustedIssuers: string[] | null;
+  /** Correlation ID stamped onto every error and log entry from this client. */
+  readonly traceId: string;
 
   readonly wallet: {
     /** Connect and return WalletState */
@@ -277,11 +290,13 @@ export function createSorokitClient(
 
   const networkConfig = networkResult.data;
   const { horizonUrl, rpcUrl, networkPassphrase } = networkConfig;
-  const logger =
+  const traceId = config.traceId ?? generateTraceId();
+  const baseLogger =
     config.logger ??
     createLogger({
       logLevel: config.logLevel ?? (config.debug ? "debug" : "off"),
     });
+  const logger = createTracedLogger(baseLogger, traceId);
   const defaultPollConfig = config.sorobanPoll;
   const errorHandler = config.errorHandler;
   const feeEstimateOptions: FeeEstimateOptions = {
@@ -290,6 +305,14 @@ export function createSorokitClient(
       ? { onFeeSurge: config.onFeeSurge }
       : {}),
   };
+
+  const applyTx = <T>(r: SorokitResult<T>): SorokitResult<T> =>
+    applyCodeTransformer(r, config.errorCodeTransformer);
+
+  const rateLimiter =
+    config.maxTxPerSecond !== undefined
+      ? new TokenBucketRateLimiter(config.maxTxPerSecond)
+      : null;
 
   logger.info("client.create", {
     operation: "client.create",
@@ -302,23 +325,24 @@ export function createSorokitClient(
   const client: SorokitClient = {
     networkConfig,
     trustedIssuers: config.trustedIssuers ?? null,
+    traceId,
 
     wallet: {
       connect: (adapter) =>
         withLogging(logger, "wallet.connect", { walletType: adapter.walletType }, () =>
           connectWallet(adapter),
-        ),
+        ).then(applyTx),
       disconnect: (adapter) =>
         withLogging(logger, "wallet.disconnect", { walletType: adapter.walletType }, () =>
           disconnectWallet(adapter),
-        ),
+        ).then(applyTx),
       signTransaction: (adapter, input) =>
         withLogging(
           logger,
           "wallet.signTransaction",
           { walletType: adapter.walletType },
           () => signTransaction(adapter, input),
-        ),
+        ).then(applyTx),
       emptyState: () => emptyWalletState(),
     },
 
@@ -331,7 +355,7 @@ export function createSorokitClient(
             withLogging(logger, "account.get", { publicKey }, () =>
               getAccount(horizonUrl, publicKey),
             ),
-        ),
+        ).then(applyTx),
       getBalances: (publicKey) =>
         withErrorHandling(
           errorHandler,
@@ -340,7 +364,7 @@ export function createSorokitClient(
             withLogging(logger, "account.getBalances", { publicKey }, () =>
               getBalances(horizonUrl, publicKey),
             ),
-        ),
+        ).then(applyTx),
       getAssetBalances: (publicKey, filter) =>
         withErrorHandling(
           errorHandler,
@@ -349,7 +373,7 @@ export function createSorokitClient(
             withLogging(logger, "account.getAssetBalances", { publicKey, filter }, () =>
               getAssetBalances(horizonUrl, publicKey, filter),
             ),
-        ),
+        ).then(applyTx),
       stream: (publicKey, streamConfig, signal) =>
         streamAccount(horizonUrl, publicKey, streamConfig, signal, logger),
       formatAddress: (publicKey, chars) => formatAddress(publicKey, chars),
@@ -364,7 +388,7 @@ export function createSorokitClient(
           sourcePublicKey,
           params,
           client.trustedIssuers,
-        );
+        ).then(applyTx);
       },
       buildCreateAccount: (sourcePublicKey, params) => {
         logger.debug("transaction.buildCreateAccount", { sourcePublicKey });
@@ -373,7 +397,7 @@ export function createSorokitClient(
           networkConfig,
           sourcePublicKey,
           params,
-        );
+        ).then(applyTx);
       },
       buildTrustline: (sourcePublicKey, params) => {
         logger.debug("transaction.buildTrustline", { sourcePublicKey });
@@ -383,19 +407,20 @@ export function createSorokitClient(
           sourcePublicKey,
           params,
           client.trustedIssuers,
-        );
+        ).then(applyTx);
       },
-      submit: (signedXdr) => {
+      submit: async (signedXdr) => {
         logger.debug("transaction.submit");
-        return submitTransaction(horizonUrl, networkPassphrase, signedXdr);
+        if (rateLimiter) await rateLimiter.acquire();
+        return submitTransaction(horizonUrl, networkPassphrase, signedXdr, config.cache).then(applyTx);
       },
       getStatus: (hash) => {
         logger.debug("transaction.getStatus", { hash });
-        return getTransactionStatus(horizonUrl, hash);
+        return getTransactionStatus(horizonUrl, hash).then(applyTx);
       },
       estimateFee: (input) => {
         logger.debug("transaction.estimateFee");
-        return estimateFee(rpcUrl, horizonUrl, networkConfig, input, config.cache);
+        return estimateFee(rpcUrl, horizonUrl, networkConfig, input, config.cache).then(applyTx);
       },
       stream: (publicKey, config, signal) => {
         logger.debug("transaction.stream", { publicKey });
@@ -414,7 +439,7 @@ export function createSorokitClient(
               ...(config.cache && { cache: config.cache }),
               ...(ttlMs !== undefined && { ttlMs }),
             }),
-        ),
+        ).then(applyTx),
       simulate: (transactionXdr) =>
         withErrorHandling(
           errorHandler,
@@ -423,7 +448,7 @@ export function createSorokitClient(
             withLogging(logger, "soroban.simulate", undefined, () =>
               simulateTransaction(rpcUrl, networkPassphrase, transactionXdr),
             ),
-        ),
+        ).then(applyTx),
       prepare: (params) =>
         withErrorHandling(
           errorHandler,
@@ -435,7 +460,7 @@ export function createSorokitClient(
               { contractId: params.contractId, method: params.method },
               () => prepareContractCall(rpcUrl, networkConfig, horizonUrl, params),
             ),
-        ),
+        ).then(applyTx),
       execute: (signedXdr, pollConfig) =>
         withErrorHandling(
           errorHandler,
@@ -448,7 +473,7 @@ export function createSorokitClient(
               pollConfig ?? defaultPollConfig,
               logger,
             ),
-        ),
+        ).then(applyTx),
       invoke: (params, signFn, pollConfig) =>
         withErrorHandling(
           errorHandler,
@@ -469,7 +494,7 @@ export function createSorokitClient(
                   logger,
                 ),
             ),
-        ),
+        ).then(applyTx),
       read: (params) =>
         withErrorHandling(
           errorHandler,
@@ -481,7 +506,7 @@ export function createSorokitClient(
               { contractId: params.contractId, method: params.method },
               () => readContract(rpcUrl, horizonUrl, networkConfig, params),
             ),
-        ),
+        ).then(applyTx),
     },
 
     network: {

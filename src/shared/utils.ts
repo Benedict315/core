@@ -50,6 +50,27 @@ export function isValidContractId(id: string): boolean {
 }
 
 /**
+ * Generate a short, URL-safe trace ID for correlating an operation chain.
+ *
+ * Prefers the platform crypto (`randomUUID`/`getRandomValues`) when available
+ * and falls back to `Math.random` so the SDK stays dependency-free and works
+ * in every runtime. The value is for correlation only, not security.
+ */
+export function generateTraceId(): string {
+  const c = (globalThis as { crypto?: Crypto }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  if (c?.getRandomValues) {
+    const bytes = c.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  }
+  return (
+    Date.now().toString(36) +
+    Math.random().toString(36).slice(2, 10) +
+    Math.random().toString(36).slice(2, 10)
+  );
+}
+
+/**
  * Retry configuration for exponential backoff.
  */
 export interface RetryConfig {
@@ -111,6 +132,68 @@ export async function retryWithBackoff<T>(
   }
 
   throw lastError;
+}
+
+/**
+ * Token bucket rate limiter.
+ * Allows up to `maxRequestsPerSecond` calls to acquire() per second.
+ * Excess calls are queued and resolved as tokens refill.
+ */
+export class TokenBucketRateLimiter {
+  private tokens: number;
+  private lastRefill: number;
+  private readonly capacity: number;
+  private readonly refillRate: number; // tokens per ms
+  private readonly queue: Array<() => void>;
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(maxRequestsPerSecond: number) {
+    if (maxRequestsPerSecond <= 0) {
+      throw new Error("maxRequestsPerSecond must be a positive number");
+    }
+    this.capacity = maxRequestsPerSecond;
+    this.tokens = maxRequestsPerSecond;
+    this.lastRefill = Date.now();
+    this.refillRate = maxRequestsPerSecond / 1000;
+    this.queue = [];
+  }
+
+  private refill(): void {
+    const now = Date.now();
+    this.tokens = Math.min(this.capacity, this.tokens + (now - this.lastRefill) * this.refillRate);
+    this.lastRefill = now;
+  }
+
+  private scheduleDrain(): void {
+    if (this.drainTimer !== null) return;
+    const msUntilToken = Math.ceil((1 - this.tokens) / this.refillRate);
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null;
+      this.drain();
+    }, Math.max(0, msUntilToken));
+  }
+
+  private drain(): void {
+    this.refill();
+    while (this.queue.length > 0 && this.tokens >= 1) {
+      this.tokens -= 1;
+      this.queue.shift()!();
+    }
+    if (this.queue.length > 0) this.scheduleDrain();
+  }
+
+  /** Acquire a token, waiting if the bucket is empty. */
+  async acquire(): Promise<void> {
+    this.refill();
+    if (this.tokens >= 1) {
+      this.tokens -= 1;
+      return;
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+      this.scheduleDrain();
+    });
+  }
 }
 
 /** Module-level map of in-flight requests keyed by a caller-supplied key. */

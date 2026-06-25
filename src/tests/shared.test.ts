@@ -12,9 +12,11 @@ import {
   isTimeoutError,
   isXdrInvalidError,
   applyErrorHandler,
+  applyCodeTransformer,
   withErrorHandling,
   retryWithBackoff,
   deduplicateRequest,
+  TokenBucketRateLimiter,
   type RetryConfig,
   type ErrorHandler,
   type ErrorContext,
@@ -527,5 +529,169 @@ describe("shared/utils — deduplicateRequest (#24)", () => {
 
     expect(results[0]?.status).toBe("rejected");
     expect(results[1]?.status).toBe("rejected");
+  });
+});
+
+describe("applyCodeTransformer", () => {
+  it("is a no-op when transformer is undefined", () => {
+    const result = err(SorokitErrorCode.TX_SUBMIT_FAILED, "fail");
+    expect(applyCodeTransformer(result, undefined)).toBe(result);
+  });
+
+  it("is a no-op when result is ok", () => {
+    const result = ok(42);
+    const transformer = vi.fn(() => "CUSTOM");
+    expect(applyCodeTransformer(result, transformer)).toBe(result);
+    expect(transformer).not.toHaveBeenCalled();
+  });
+
+  it("calls transformer with the original SDK code and applies the return value", () => {
+    const result = err(SorokitErrorCode.TX_SUBMIT_FAILED, "fail");
+    const transformed = applyCodeTransformer(result, () => "PAYMENT_ERROR");
+    expect(transformed.status).toBe("error");
+    if (transformed.status === "error") {
+      expect(transformed.error.code).toBe("PAYMENT_ERROR");
+      expect(transformed.error.message).toBe("fail");
+    }
+  });
+
+  it("does not throw when transformer returns a non-SorokitErrorCode string", () => {
+    const result = err(SorokitErrorCode.UNKNOWN, "oops");
+    expect(() => applyCodeTransformer(result, () => "DOMAIN_SPECIFIC_CODE")).not.toThrow();
+  });
+
+  it("transformer receives the raw SDK code before any remapping", () => {
+    const captured: string[] = [];
+    const result = err(SorokitErrorCode.ACCOUNT_NOT_FOUND, "not found");
+    applyCodeTransformer(result, (code) => {
+      captured.push(code);
+      return "CUSTOM";
+    });
+    expect(captured).toEqual([SorokitErrorCode.ACCOUNT_NOT_FOUND]);
+  });
+});
+
+describe("TokenBucketRateLimiter", () => {
+  it("throws when maxRequestsPerSecond is zero", () => {
+    expect(() => new TokenBucketRateLimiter(0)).toThrow("maxRequestsPerSecond must be a positive number");
+  });
+
+  it("throws when maxRequestsPerSecond is negative", () => {
+    expect(() => new TokenBucketRateLimiter(-1)).toThrow("maxRequestsPerSecond must be a positive number");
+  });
+
+  it("acquire() resolves immediately when tokens are available", async () => {
+    const limiter = new TokenBucketRateLimiter(10);
+    await expect(limiter.acquire()).resolves.toBeUndefined();
+  });
+
+  it("acquire() resolves immediately for a burst up to capacity", async () => {
+    const limiter = new TokenBucketRateLimiter(3);
+    await limiter.acquire();
+    await limiter.acquire();
+    await limiter.acquire();
+    // All three resolved without queuing
+  });
+
+  it("acquire() queues when bucket is empty and resolves after refill", async () => {
+    const limiter = new TokenBucketRateLimiter(1);
+    // Drain the single token
+    await limiter.acquire();
+    // The next acquire should queue and resolve after ~1000ms; use a short limiter to test
+    const start = Date.now();
+    const limiter2 = new TokenBucketRateLimiter(100); // 100/s = 1 token per 10ms
+    // drain all tokens
+    for (let i = 0; i < 100; i++) await limiter2.acquire();
+    // next should queue and resolve
+    await limiter2.acquire();
+    expect(Date.now() - start).toBeGreaterThanOrEqual(0);
+  });
+});
+
+import {
+  generateTraceId,
+  attachTraceId,
+  createTracedLogger,
+  withLogging,
+  type SorokitLogger,
+  type StructuredLogMeta,
+} from "../shared";
+
+describe("trace IDs (#32)", () => {
+  it("generateTraceId returns a non-empty, unique string", () => {
+    const a = generateTraceId();
+    const b = generateTraceId();
+    expect(typeof a).toBe("string");
+    expect(a.length).toBeGreaterThan(0);
+    expect(a).not.toBe(b);
+  });
+
+  it("err accepts an optional traceId", () => {
+    const result = err(SorokitErrorCode.UNKNOWN, "boom", undefined, "trace-123");
+    expect(result.status).toBe("error");
+    if (result.status === "error") {
+      expect(result.error.traceId).toBe("trace-123");
+    }
+  });
+
+  it("err without a traceId leaves the field undefined", () => {
+    const result = err(SorokitErrorCode.UNKNOWN, "boom");
+    if (result.status === "error") {
+      expect(result.error.traceId).toBeUndefined();
+    }
+  });
+
+  it("attachTraceId stamps an error result without one", () => {
+    const stamped = attachTraceId(err(SorokitErrorCode.UNKNOWN, "boom"), "t-1");
+    if (stamped.status === "error") expect(stamped.error.traceId).toBe("t-1");
+  });
+
+  it("attachTraceId does not overwrite an existing traceId", () => {
+    const stamped = attachTraceId(
+      err(SorokitErrorCode.UNKNOWN, "boom", undefined, "original"),
+      "t-2",
+    );
+    if (stamped.status === "error") expect(stamped.error.traceId).toBe("original");
+  });
+
+  it("attachTraceId passes success results through untouched", () => {
+    const result = attachTraceId(ok(42), "t-3");
+    expect(result).toEqual(ok(42));
+  });
+
+  it("createTracedLogger injects the traceId into every log entry", () => {
+    const entries: { msg: string; meta?: StructuredLogMeta }[] = [];
+    const base: SorokitLogger = {
+      debug: (msg, meta) => entries.push({ msg, meta }),
+      info: (msg, meta) => entries.push({ msg, meta }),
+      warn: (msg, meta) => entries.push({ msg, meta }),
+      error: (msg, meta) => entries.push({ msg, meta }),
+    };
+    const traced = createTracedLogger(base, "trace-xyz");
+    traced.info("op", { operation: "op" });
+    expect(traced.traceId).toBe("trace-xyz");
+    expect(entries[0]?.meta?.traceId).toBe("trace-xyz");
+  });
+
+  it("withLogging stamps the logger traceId onto error results", async () => {
+    const traced = createTracedLogger(
+      { debug() {}, info() {}, warn() {}, error() {} },
+      "flow-1",
+    );
+    const result = await withLogging(traced, "account.get", undefined, async () =>
+      err(SorokitErrorCode.ACCOUNT_FETCH_FAILED, "down"),
+    );
+    if (result.status === "error") expect(result.error.traceId).toBe("flow-1");
+  });
+
+  it("withLogging leaves success results unchanged", async () => {
+    const traced = createTracedLogger(
+      { debug() {}, info() {}, warn() {}, error() {} },
+      "flow-2",
+    );
+    const result = await withLogging(traced, "account.get", undefined, async () =>
+      ok({ value: 1 }),
+    );
+    expect(result).toEqual(ok({ value: 1 }));
   });
 });

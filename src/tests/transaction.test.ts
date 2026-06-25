@@ -1,13 +1,21 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createHash } from "crypto";
 import { estimateFee } from "../transaction/estimateFee";
 import type { FeeEstimate } from "../transaction/estimateFee";
 import type { SorokitCache } from "../shared/cache";
 import { DEFAULT_FEE_CACHE_TTL_MS } from "../shared/constants";
+import {
+  buildPaymentTransaction,
+  buildCreateAccountTransaction,
+  buildTrustlineTransaction,
+} from "../transaction/buildTransaction";
+import { SorokitErrorCode } from "../shared/response";
 import type { ResolvedNetworkConfig } from "../shared/types";
 import {
   buildPaymentWithTrustline,
   buildSwapTransaction,
+  buildPaymentTransaction,
+  clearSequenceCache,
 } from "../transaction/buildTransaction";
 import type {
   PaymentWithTrustlineParams,
@@ -20,6 +28,7 @@ import {
   applyTransactionFilters,
   streamTransactions,
 } from "../transaction/streamTransactions";
+import { TokenBucketRateLimiter } from "../shared/utils";
 
 const {
   mockSimulateTransaction,
@@ -53,15 +62,45 @@ const {
 
 // ─── Hoisted mocks (must be defined before vi.mock is hoisted) ────────────────
 
+const transactionBuilderInstances: Array<{ memo?: unknown }> = [];
+
 const mocks = vi.hoisted(() => ({
   simulateTransaction: vi.fn(),
   fromXDR: vi.fn(),
   isSimulationSuccess: vi.fn(),
   isSimulationError: vi.fn(),
+  loadAccount: vi.fn(),
 }));
 
 vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+
+  class MockTransactionBuilder {
+    static fromXDR = mocks.fromXDR;
+    memo?: unknown;
+
+    constructor(_sourceAccount: unknown, _options: unknown) {
+      transactionBuilderInstances.push(this);
+    }
+
+    addOperation() {
+      return this;
+    }
+
+    setTimeout() {
+      return this;
+    }
+
+    addMemo(memo: unknown) {
+      this.memo = memo;
+      return this;
+    }
+
+    build() {
+      return { toXDR: () => MOCK_XDR };
+    }
+  }
+
   const mockAsset = vi.fn().mockImplementation((code: string, issuer?: string) => {
     return { code, issuer: issuer || null };
   });
@@ -110,6 +149,13 @@ vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
         isSimulationError: mocks.isSimulationError,
       },
     },
+    Horizon: {
+      ...actual.Horizon,
+      Server: vi.fn().mockImplementation(() => ({
+        loadAccount: mocks.loadAccount,
+      })),
+    },
+    TransactionBuilder: MockTransactionBuilder,
 
   };
 });
@@ -441,6 +487,7 @@ describe("transaction streaming filters", () => {
 
 describe("estimateFee — caching", () => {
   beforeEach(() => {
+    transactionBuilderInstances.length = 0;
     mockSimulateTransaction.mockReset();
     mockTransactionsCall.mockReset();
     mockIsSimulationSuccess.mockReset();
@@ -457,6 +504,7 @@ describe("estimateFee — caching", () => {
     mocks.fromXDR.mockReturnValue({});
     mocks.isSimulationSuccess.mockReturnValue(true);
     mocks.isSimulationError.mockReturnValue(false);
+    mocks.loadAccount.mockResolvedValue({});
   });
 
   describe("cache hit", () => {
@@ -652,6 +700,128 @@ describe("estimateFee — caching", () => {
       if (result.status === "ok") {
         expect(result.data.simulated).toBe(false);
       }
+    });
+  });
+
+  describe("transaction builders — memo validation", () => {
+    const sourcePublicKey = "GBTABBLFJWSIJKGRVJMOV477L42GXCHFHGDUOCDMC7MXWASTPZKQNB25";
+    const destination = "GAAL6LIAG2FGFQTKMUNGLCSCAM722PPYRVK2PXEMC6KNRRWLCFTYQD7R";
+    const issuerPublicKey = "GAPUEDT4TZGUN64L4SAN4YE5JDGIYTEDQZXLJMYS4VTHOAT5OBLNCIFK";
+
+    beforeEach(() => {
+      mocks.loadAccount.mockResolvedValue({
+        accountId: () => sourcePublicKey,
+        sequenceNumber: () => "1",
+        incrementSequenceNumber: () => {},
+      });
+      transactionBuilderInstances.length = 0;
+    });
+
+    it("fails payment build when requireMemo is true and no memo provided", async () => {
+      const result = await buildPaymentTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        sourcePublicKey,
+        {
+          destination,
+          amount: "10",
+          requireMemo: true,
+        },
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.code).toBe(SorokitErrorCode.TX_BUILD_FAILED);
+        expect(result.error.message).toContain("Memo is required");
+      }
+    });
+
+    it("builds payment transaction with valid text memo", async () => {
+      const result = await buildPaymentTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        sourcePublicKey,
+        {
+          destination,
+          amount: "10",
+          memo: "hello",
+          memoType: "text",
+        },
+      );
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data).toBe(MOCK_XDR);
+      }
+      expect(transactionBuilderInstances).toHaveLength(1);
+      expect((transactionBuilderInstances[0].memo as any)?.type).toBe("text");
+      expect((transactionBuilderInstances[0].memo as any)?.value).toBe("hello");
+    });
+
+    it("fails payment transaction with invalid hash memo", async () => {
+      const result = await buildPaymentTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        sourcePublicKey,
+        {
+          destination,
+          amount: "10",
+          memo: "deadbeef",
+          memoType: "hash",
+        },
+      );
+
+      expect(result.status).toBe("error");
+      if (result.status === "error") {
+        expect(result.error.code).toBe(SorokitErrorCode.TX_BUILD_FAILED);
+        expect(result.error.message).toContain("Invalid memo for type hash");
+      }
+    });
+
+    it("builds create account transaction with valid id memo", async () => {
+      const result = await buildCreateAccountTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        sourcePublicKey,
+        {
+          destination,
+          startingBalance: "2",
+          memo: "1234567890",
+          memoType: "id",
+        },
+      );
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data).toBe(MOCK_XDR);
+      }
+      expect(transactionBuilderInstances).toHaveLength(1);
+      expect((transactionBuilderInstances[0].memo as any)?.type).toBe("id");
+    });
+
+    it("builds trustline transaction with valid return memo", async () => {
+      const result = await buildTrustlineTransaction(
+        networkConfig.horizonUrl,
+        networkConfig,
+        sourcePublicKey,
+        {
+          assetCode: "USD",
+          assetIssuer: issuerPublicKey,
+          memo: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          memoType: "return",
+        },
+      );
+
+      if (result.status === "error") {
+        console.error("Trustline build error", result.error);
+      }
+
+      expect(result.status).toBe("ok");
+      if (result.status === "ok") {
+        expect(result.data).toBe(MOCK_XDR);
+      }
+      expect(transactionBuilderInstances).toHaveLength(1);
+      expect((transactionBuilderInstances[0].memo as any)?.type).toBe("return");
     });
   });
 });
@@ -1016,5 +1186,178 @@ describe("transaction caching", () => {
       expect(result.status).toBe("ok");
       expect(mockTransactionCall).toHaveBeenCalledOnce();
     });
+  });
+});
+
+describe("sequence number auto-fetch cache", () => {
+  beforeEach(() => {
+    mockLoadAccount.mockReset();
+    clearSequenceCache();
+  });
+
+  afterEach(() => {
+    clearSequenceCache();
+  });
+
+  it("calls Horizon on cache miss and returns a result", async () => {
+    mockLoadAccount.mockResolvedValueOnce({
+      sequence: "100",
+      sequenceNumber: () => "100",
+      incrementSequenceNumber: vi.fn(),
+      subentry_count: 0,
+      balances: [],
+      accountId: () => "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
+    });
+
+    const result = await buildPaymentTransaction(
+      networkConfig.horizonUrl,
+      networkConfig,
+      "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
+      {
+        destination: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+        amount: "10",
+        autoFetchSequence: true,
+      },
+    );
+
+    expect(mockLoadAccount).toHaveBeenCalledOnce();
+    // Result may succeed or fail depending on mock build; we just verify Horizon was called
+    expect(result).toBeDefined();
+  });
+
+  it("does not call Horizon when cache is populated within TTL", async () => {
+    const mockAccount = {
+      sequence: "100",
+      sequenceNumber: vi.fn().mockReturnValue("101"),
+      incrementSequenceNumber: vi.fn(),
+      subentry_count: 0,
+      balances: [],
+      accountId: () => "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
+    };
+    mockLoadAccount.mockResolvedValue(mockAccount);
+
+    const params = {
+      destination: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+      amount: "10",
+      autoFetchSequence: true as const,
+    };
+    const sourceKey = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA";
+
+    // First call populates the cache
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+    mockLoadAccount.mockReset();
+
+    // Second call within TTL should use cache
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+
+    expect(mockLoadAccount).not.toHaveBeenCalled();
+  });
+
+  it("calls Horizon again after cache TTL expires", async () => {
+    const mockAccount = {
+      sequence: "100",
+      sequenceNumber: vi.fn().mockReturnValue("101"),
+      incrementSequenceNumber: vi.fn(),
+      subentry_count: 0,
+      balances: [],
+      accountId: () => "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
+    };
+    mockLoadAccount.mockResolvedValue(mockAccount);
+
+    const params = {
+      destination: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+      amount: "10",
+      autoFetchSequence: true as const,
+    };
+    const sourceKey = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA";
+
+    // Populate cache using a past timestamp
+    const realDateNow = Date.now;
+    // First call with normal time
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+    mockLoadAccount.mockReset();
+    mockLoadAccount.mockResolvedValue(mockAccount);
+
+    // Simulate time past TTL by mocking Date.now to return future time
+    Date.now = vi.fn().mockReturnValue(realDateNow() + 6_000); // 6 seconds later
+
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+
+    Date.now = realDateNow; // restore
+    expect(mockLoadAccount).toHaveBeenCalledOnce();
+  });
+
+  it("does not use cache when autoFetchSequence is false", async () => {
+    const mockAccount = {
+      sequence: "100",
+      sequenceNumber: vi.fn().mockReturnValue("101"),
+      incrementSequenceNumber: vi.fn(),
+      subentry_count: 0,
+      balances: [],
+      accountId: () => "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
+    };
+    mockLoadAccount.mockResolvedValue(mockAccount);
+
+    const sourceKey = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA";
+    const params = {
+      destination: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+      amount: "10",
+    };
+
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+
+    expect(mockLoadAccount).toHaveBeenCalledTimes(2);
+  });
+
+  it("clearSequenceCache() removes all cached entries", async () => {
+    const mockAccount = {
+      sequence: "100",
+      sequenceNumber: vi.fn().mockReturnValue("101"),
+      incrementSequenceNumber: vi.fn(),
+      subentry_count: 0,
+      balances: [],
+      accountId: () => "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA",
+    };
+    mockLoadAccount.mockResolvedValue(mockAccount);
+
+    const sourceKey = "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWNA";
+    const params = {
+      destination: "GBBD47IF6LWK5P7V6XZCHJSAXTSPG4FJHOUOHAUZTF5YQK4Q2GB7S7V2",
+      amount: "10",
+      autoFetchSequence: true as const,
+    };
+
+    // Populate cache
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+    mockLoadAccount.mockReset();
+    mockLoadAccount.mockResolvedValue(mockAccount);
+
+    clearSequenceCache();
+
+    // Cache cleared — should fetch again
+    await buildPaymentTransaction(networkConfig.horizonUrl, networkConfig, sourceKey, params);
+    expect(mockLoadAccount).toHaveBeenCalledOnce();
+  });
+});
+
+describe("TokenBucketRateLimiter — rate limiting on submit", () => {
+  it("acquire() resolves immediately when tokens are available", async () => {
+    const limiter = new TokenBucketRateLimiter(5);
+    const start = Date.now();
+    await limiter.acquire();
+    expect(Date.now() - start).toBeLessThan(50);
+  });
+
+  it("constructor throws when maxRequestsPerSecond is 0", () => {
+    expect(() => new TokenBucketRateLimiter(0)).toThrow(
+      "maxRequestsPerSecond must be a positive number",
+    );
+  });
+
+  it("constructor throws when maxRequestsPerSecond is negative", () => {
+    expect(() => new TokenBucketRateLimiter(-5)).toThrow(
+      "maxRequestsPerSecond must be a positive number",
+    );
   });
 });
