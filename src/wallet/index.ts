@@ -16,6 +16,16 @@ export type {
   WalletDiagnosticOptions,
 } from "./types";
 export { WalletType as WalletTypeEnum } from "./types";
+export {
+  getSigningHistory,
+  exportSigningHistory,
+  InMemorySigningHistoryStore,
+} from "./signingHistory";
+export type {
+  SigningRecord,
+  SigningHistoryFilter,
+  SigningHistoryStore,
+} from "./signingHistory";
 
 import { ok, err, SorokitErrorCode } from "../shared/response";
 import type { SorokitResult } from "../shared/response";

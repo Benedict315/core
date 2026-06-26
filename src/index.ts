@@ -17,6 +17,16 @@ export { FreighterAdapter } from "./wallet/adapters/freighter";
 export { XBullAdapter } from "./wallet/adapters/xbull";
 export { LobstrAdapter } from "./wallet/adapters/lobstr";
 export { collectMultiSignatures, diagnoseWalletConnection } from "./wallet";
+export {
+  getSigningHistory,
+  exportSigningHistory,
+  InMemorySigningHistoryStore,
+} from "./wallet/signingHistory";
+export type {
+  SigningRecord,
+  SigningHistoryFilter,
+  SigningHistoryStore,
+} from "./wallet/signingHistory";
 
 // ─── Wallet types ─────────────────────────────────────────────────────────────
 export type {
